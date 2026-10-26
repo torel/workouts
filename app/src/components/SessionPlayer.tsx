@@ -1,4 +1,4 @@
-import { useEffect, useState, useRef } from 'react';
+import { useEffect, useState, useRef, useCallback } from 'react';
 import { getSessionById, parseCustomSession } from '../data/sessions';
 import { getExerciseById } from '../data/exercises';
 import type { Session, CompletedSet, CompletedSession } from '../types';
@@ -24,14 +24,16 @@ const SessionPlayer = ({ sessionId, searchParams }: Props) => {
   const [state, setState] = useState<PlayerState>('idle');
   const [currentExerciseIndex, setCurrentExerciseIndex] = useState(0);
   const [currentRound, setCurrentRound] = useState(1);
-  const [timeRemaining, setTimeRemaining] = useState(0);
   const [isPaused, setIsPaused] = useState(false);
   const [completedSets, setCompletedSets] = useState<CompletedSet[]>([]);
   const [muted, setMutedState] = useState(isMutedState());
   const [sessionStartTime, setSessionStartTime] = useState<number | null>(null);
+  const [, setTick] = useState(0);
   
-  const startTimeRef = useRef<number>(0);
+  const timerEndTimeRef = useRef<number>(0);
+  const pauseTimeRef = useRef<number>(0);
   const animationFrameRef = useRef<number | undefined>(undefined);
+  const handleTimerCompleteRef = useRef<() => void>(() => {});
   const totalRounds = parseInt(searchParams.get('rounds') || '3');
 
   // Load session
@@ -67,90 +69,40 @@ const SessionPlayer = ({ sessionId, searchParams }: Props) => {
     setMuted(newMuted);
   };
 
-  const updateTimer = (_timestamp?: number) => {
-    const elapsed = (Date.now() - startTimeRef.current) / 1000;
-    const remaining = Math.max(0, Math.ceil(timeRemaining - elapsed));
+  const getTimeRemaining = () => {
+    return Math.max(0, (timerEndTimeRef.current - Date.now()) / 1000);
+  };
+
+  const updateTimer = useCallback((_timestamp?: number) => {
+    const now = Date.now();
+    const remaining = Math.max(0, (timerEndTimeRef.current - now) / 1000);
     
-    if (remaining !== Math.ceil(timeRemaining - (elapsed - 0.001))) {
-      // Second changed
-      if (remaining <= 3 && remaining > 0) {
-        playCountdownBeep();
-      }
+    // Trigger re-render
+    setTick(prev => prev + 1);
+    
+    const remainingCeil = Math.ceil(remaining);
+    const prevRemainingCeil = Math.ceil(remaining + 0.1);
+    
+    if (remainingCeil !== prevRemainingCeil && remainingCeil <= 3 && remainingCeil > 0) {
+      playCountdownBeep();
     }
 
-    if (elapsed >= timeRemaining) {
-      handleTimerComplete();
+    if (remaining <= 0) {
+      handleTimerCompleteRef.current();
     } else if (!isPaused) {
       animationFrameRef.current = requestAnimationFrame(updateTimer);
     }
-  };
+  }, [isPaused]);
 
   const startTimer = (duration: number) => {
-    setTimeRemaining(duration);
-    startTimeRef.current = Date.now();
+    const endTime = Date.now() + (duration * 1000);
+    timerEndTimeRef.current = endTime;
     animationFrameRef.current = requestAnimationFrame(updateTimer);
   };
 
-  const handleTimerComplete = () => {
-    if (animationFrameRef.current) {
-      cancelAnimationFrame(animationFrameRef.current);
-    }
-
-    playBeep();
-
-    if (state === 'get-ready') {
-      // Start exercise
-      const exercise = session!.exercises[currentExerciseIndex];
-      const duration = exercise.duration || 0;
-      
-      if (duration > 0) {
-        setState('exercise');
-        startTimer(duration);
-      } else {
-        // Rep-based exercise
-        setState('exercise');
-        setTimeRemaining(0);
-      }
-    } else if (state === 'exercise') {
-      // Check if there's rest after
-      const exercise = session!.exercises[currentExerciseIndex];
-      if (exercise.restAfter && exercise.restAfter > 0) {
-        setState('rest');
-        startTimer(exercise.restAfter);
-      } else {
-        handleNextExercise();
-      }
-    } else if (state === 'rest') {
-      handleNextExercise();
-    }
-  };
-
-  const handleNextExercise = () => {
-    const nextIndex = currentExerciseIndex + 1;
-
-    if (nextIndex >= session!.exercises.length) {
-      // Round complete
-      if (currentRound >= totalRounds) {
-        // Session complete
-        handleSessionComplete();
-      } else {
-        // Next round
-        setCurrentRound(currentRound + 1);
-        setCurrentExerciseIndex(0);
-        setState('get-ready');
-        startTimer(5);
-      }
-    } else {
-      // Next exercise
-      setCurrentExerciseIndex(nextIndex);
-      setState('get-ready');
-      startTimer(5);
-    }
-  };
-
-  const handleSessionComplete = async () => {
+  const handleSessionComplete = useCallback(async () => {
     setState('complete');
-    setTimeRemaining(0);
+    timerEndTimeRef.current = 0;
     playFinishChime();
     releaseWakeLock();
 
@@ -171,7 +123,77 @@ const SessionPlayer = ({ sessionId, searchParams }: Props) => {
         console.error('Failed to save session:', error);
       }
     }
-  };
+  }, [session, sessionStartTime, completedSets]);
+
+  const handleNextExercise = useCallback(() => {
+    const nextIndex = currentExerciseIndex + 1;
+
+    if (nextIndex >= session!.exercises.length) {
+      // Round complete
+      if (currentRound >= totalRounds) {
+        // Session complete
+        handleSessionComplete();
+      } else {
+        // Next round
+        setCurrentRound(currentRound + 1);
+        setCurrentExerciseIndex(0);
+        setState('get-ready');
+        const endTime = Date.now() + 5000;
+        timerEndTimeRef.current = endTime;
+        animationFrameRef.current = requestAnimationFrame(updateTimer);
+      }
+    } else {
+      // Next exercise
+      setCurrentExerciseIndex(nextIndex);
+      setState('get-ready');
+      const endTime = Date.now() + 5000;
+      timerEndTimeRef.current = endTime;
+      animationFrameRef.current = requestAnimationFrame(updateTimer);
+    }
+  }, [currentExerciseIndex, session, currentRound, totalRounds, handleSessionComplete]);
+
+  const handleTimerComplete = useCallback(() => {
+    if (animationFrameRef.current) {
+      cancelAnimationFrame(animationFrameRef.current);
+    }
+
+    playBeep();
+
+    if (state === 'get-ready') {
+      // Start exercise
+      const exercise = session!.exercises[currentExerciseIndex];
+      const duration = exercise.duration || 0;
+      
+      if (duration > 0) {
+        setState('exercise');
+        const endTime = Date.now() + (duration * 1000);
+        timerEndTimeRef.current = endTime;
+        animationFrameRef.current = requestAnimationFrame(updateTimer);
+      } else {
+        // Rep-based exercise
+        setState('exercise');
+        timerEndTimeRef.current = 0;
+      }
+    } else if (state === 'exercise') {
+      // Check if there's rest after
+      const exercise = session!.exercises[currentExerciseIndex];
+      if (exercise.restAfter && exercise.restAfter > 0) {
+        setState('rest');
+        const endTime = Date.now() + (exercise.restAfter * 1000);
+        timerEndTimeRef.current = endTime;
+        animationFrameRef.current = requestAnimationFrame(updateTimer);
+      } else {
+        handleNextExercise();
+      }
+    } else if (state === 'rest') {
+      handleNextExercise();
+    }
+  }, [state, session, currentExerciseIndex, handleNextExercise]);
+
+  // Keep the ref up to date
+  useEffect(() => {
+    handleTimerCompleteRef.current = handleTimerComplete;
+  }, [handleTimerComplete]);
 
   const handleStart = async () => {
     if (state === 'idle') {
@@ -186,21 +208,18 @@ const SessionPlayer = ({ sessionId, searchParams }: Props) => {
 
   const handlePause = () => {
     if (isPaused) {
-      // Resume
+      // Resume - extend the end time by how long we were paused
       setIsPaused(false);
-      const elapsed = (Date.now() - startTimeRef.current) / 1000;
-      const remaining = timeRemaining - elapsed;
-      startTimeRef.current = Date.now();
-      setTimeRemaining(remaining);
+      const pauseDuration = Date.now() - pauseTimeRef.current;
+      timerEndTimeRef.current = timerEndTimeRef.current + pauseDuration;
       animationFrameRef.current = requestAnimationFrame(updateTimer);
     } else {
-      // Pause
+      // Pause - record pause time
       setIsPaused(true);
       if (animationFrameRef.current) {
         cancelAnimationFrame(animationFrameRef.current);
       }
-      const elapsed = (Date.now() - startTimeRef.current) / 1000;
-      setTimeRemaining(Math.max(0, timeRemaining - elapsed));
+      pauseTimeRef.current = Date.now();
     }
   };
 
@@ -211,7 +230,7 @@ const SessionPlayer = ({ sessionId, searchParams }: Props) => {
     setState('idle');
     setCurrentExerciseIndex(0);
     setCurrentRound(1);
-    setTimeRemaining(0);
+    timerEndTimeRef.current = 0;
     setIsPaused(false);
     setCompletedSets([]);
     setSessionStartTime(null);
@@ -312,7 +331,7 @@ const SessionPlayer = ({ sessionId, searchParams }: Props) => {
                 Round {currentRound} of {totalRounds}
               </p>
             </div>
-            <div className="player-timer">{formatTime(Math.ceil(timeRemaining - (Date.now() - startTimeRef.current) / 1000))}</div>
+            <div className="player-timer">{formatTime(Math.ceil(getTimeRemaining()))}</div>
             {currentExercise && (
               <div className="player-current">
                 <h2>{currentExercise.name}</h2>
@@ -349,11 +368,11 @@ const SessionPlayer = ({ sessionId, searchParams }: Props) => {
                 )}
                 {isBoxBreathing && (
                   <BoxBreathingVisual
-                    timeRemaining={Math.ceil(timeRemaining - (Date.now() - startTimeRef.current) / 1000)}
+                    timeRemaining={Math.ceil(getTimeRemaining())}
                   />
                 )}
-                <div className={`player-timer ${Math.ceil(timeRemaining - (Date.now() - startTimeRef.current) / 1000) <= 3 ? 'warning' : ''}`}>
-                  {formatTime(Math.ceil(timeRemaining - (Date.now() - startTimeRef.current) / 1000))}
+                <div className={`player-timer ${Math.ceil(getTimeRemaining()) <= 3 ? 'warning' : ''}`}>
+                  {formatTime(Math.ceil(getTimeRemaining()))}
                 </div>
               </>
             ) : (
@@ -399,7 +418,7 @@ const SessionPlayer = ({ sessionId, searchParams }: Props) => {
                 Round {currentRound} of {totalRounds}
               </p>
             </div>
-            <div className="player-timer">{formatTime(Math.ceil(timeRemaining - (Date.now() - startTimeRef.current) / 1000))}</div>
+            <div className="player-timer">{formatTime(Math.ceil(getTimeRemaining()))}</div>
             <div className="player-controls">
               <button className="button button-secondary" onClick={handleSkip}>
                 ⏭ Skip Rest

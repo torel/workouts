@@ -1,4 +1,5 @@
 import type { Session } from '../types';
+import { getExerciseById } from './exercises';
 
 export const sessions: Session[] = [
   // Strength sessions
@@ -159,10 +160,27 @@ export const parseCustomSession = (exerciseIds: string[], rounds?: number): Sess
     category: 'strength',
     description: `${exerciseIds.length} exercises${rounds ? ` × ${rounds} rounds` : ''}`,
     duration: 'Custom',
-    exercises: exerciseIds.map(id => ({
-      exerciseId: id,
-      reps: 12,
-      restAfter: 30,
-    })),
+    exercises: exerciseIds.map(id => {
+      const exercise = getExerciseById(id);
+      
+      // Check if it's a hold-based exercise
+      if (exercise?.hold) {
+        // Extract duration from hold string (e.g., "30–45 s" → use the higher value)
+        const holdMatch = exercise.hold.match(/(\d+)(?:–(\d+))?\s*s/);
+        const duration = holdMatch ? parseInt(holdMatch[2] || holdMatch[1]) : 45;
+        return {
+          exerciseId: id,
+          duration,
+          restAfter: 30,
+        };
+      }
+      
+      // Default to rep-based
+      return {
+        exerciseId: id,
+        reps: 12,
+        restAfter: 30,
+      };
+    }),
   };
 };
